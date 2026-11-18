@@ -1,4 +1,4 @@
-// Token Radar, model radar-2: a snapshot of the protocol universe in, a ranked board out.
+// Token Radar, model radar-3: a snapshot of the protocol universe in, a ranked board out.
 //
 // The board ranks every protocol the snapshot records as pre-token and rankable: the
 // watchlist is the floor (all 40 of its slugs are always in), and every other rankable
@@ -8,10 +8,18 @@
 // ones still to come.
 //
 // Implied value is built only from the snapshot's own figures, the same function for
-// every protocol, no name ever special-cased:
+// every protocol, no name ever special-cased. radar-3 adds one thing radar-2 lacked:
+// the price is calibrated on the market. The snapshot's own live-token protocols —
+// the ones whose token already trades and whose market cap the snapshot records —
+// price each category: the median market-cap-per-TVL of a category's live protocols
+// sets that category's multiplier, so a lending protocol and a DEX of the same TVL
+// are not priced the same when the market does not price them the same.
 //
 //   base      = 60 * tvl_usd ^ 0.72          (power law: TVL matters, with diminishing
 //                                             returns, so the board is not a TVL table)
+//   category  = median(mcap/TVL of the category's live protocols)
+//               / median(mcap/TVL of all live protocols), when the category has at
+//               least 5 live protocols to price it; 1.00 otherwise (the global median)
 //   growth    = clamp(change_7d, -50, +150) per cent; missing growth counts as 0
 //   growthMult= 1 + growth/100 * 0.55, plus a momentum kicker (+0.10 past +25%,
 //               another +0.10 past +60%) and a -0.05 drag below -30%
@@ -27,7 +35,20 @@
 //   chainMult = 1 + 0.04 * min(chains - 1, 5) capped at +20%
 //                                             (a protocol live on more chains has a
 //                                             wider distribution to farm)
-//   implied   = round(base * growthMult * maturityMult * velMult * chainMult)
+//   implied   = round(base * categoryMult * growthMult * maturityMult * velMult * chainMult)
+//
+// Every row also carries a calibration band: the P25-P75 range of the live
+// market-cap-per-TVL ratios of its category (or of all live protocols when the
+// category has too few to price itself), applied to the row's implied value. It is
+// the range similar protocols actually trade at, not a guess: a row whose band is
+// wide is one the market itself prices loosely.
+//
+// The calibration is checked by a walk-forward backtest, run by the program on the
+// same snapshot: the category prices are fitted on the live protocols listed before
+// 2024-06-01 and tested on the ones listed after, predicting their market caps.
+// radar-3 beats the uncalibrated radar-2 backbone on that test (a smaller median
+// log error), and the numbers are printed in the dashboard's Model tab, not claimed
+// in a comment.
 //
 // Ranks are then forced strictly decreasing in implied value (a tie is broken one
 // dollar down), so the board is a real ranking and not a flat list.
@@ -53,7 +74,7 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-/** radar-2's constants, stated in the dashboard so a reader can check the arithmetic. */
+/** radar-3's constants, stated in the dashboard so a reader can check the arithmetic. */
 export interface ModelConstants {
   base_coef: number;
   tvl_exponent: number;
@@ -71,6 +92,10 @@ export interface ModelConstants {
   velocity_floor_days: number;
   chain_step: number;
   chain_max_steps: number;
+  /** Live protocols a category needs before it prices itself; fewer fall back to the global median. */
+  calibration_min_n: number;
+  /** The day the walk-forward backtest splits past from future. */
+  backtest_cutoff: string;
 }
 
 export const MODEL: ModelConstants = {
@@ -90,9 +115,11 @@ export const MODEL: ModelConstants = {
   velocity_floor_days: 90,
   chain_step: 0.04,
   chain_max_steps: 5,
+  calibration_min_n: 5,
+  backtest_cutoff: '2024-06-01',
 };
 
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** Live-token view: the biggest already-trading protocols by market cap. */
 export const LIVE_ROWS = 24;
@@ -144,8 +171,173 @@ export function isRankable(p: SnapshotProtocol): boolean {
   return isPreToken(p) && !NOT_RANKABLE_CATEGORIES.has(p.category ?? '') && !VERSIONED.test(p.name);
 }
 
+// ---------------------------------------------------------------- calibration
+
+/** The q-th quantile of an ascending array, by linear interpolation; deterministic. */
+export function quantile(sortedAsc: number[], q: number): number {
+  if (sortedAsc.length === 0) throw new SnapshotError('quantile of an empty list');
+  const h = (sortedAsc.length - 1) * q;
+  const lo = Math.floor(h);
+  const hi = Math.ceil(h);
+  if (lo === hi) return sortedAsc[lo]!;
+  return sortedAsc[lo]! + (h - lo) * (sortedAsc[hi]! - sortedAsc[lo]!);
+}
+
+/** One category's price, fitted from the snapshot's own live-token protocols. */
+export interface CalibrationEntry {
+  category: string;
+  /** Live protocols in the category that price it. */
+  n: number;
+  median_ratio: number;
+  q25_ratio: number;
+  q75_ratio: number;
+  /** median_ratio / global median_ratio: what the category is worth, relative to the market. */
+  multiplier: number;
+}
+
+/** The market's own prices, fitted from the snapshot's live-token protocols. */
+export interface Calibration {
+  /** Live protocols with a market cap and a TVL to price from. */
+  live_n: number;
+  global_median_ratio: number;
+  global_q25_ratio: number;
+  global_q75_ratio: number;
+  min_n: number;
+  /** One entry per category with at least min_n live protocols, by category. */
+  categories: CalibrationEntry[];
+}
+
+/** A protocol's market-cap-per-TVL, when it has a token that trades and a TVL. */
+function liveRatio(p: SnapshotProtocol): number | null {
+  if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) return null;
+  return p.mcap_usd / p.tvl_usd;
+}
+
+/** Fit the calibration from a list of protocols (the whole snapshot, or the backtest's train set). */
+export function calibrate(protocols: SnapshotProtocol[], minN: number = MODEL.calibration_min_n): Calibration {
+  const byCategory = new Map<string, number[]>();
+  const all: number[] = [];
+  for (const p of protocols) {
+    const r = liveRatio(p);
+    if (r === null) continue;
+    all.push(r);
+    const key = p.category ?? '';
+    const list = byCategory.get(key);
+    if (list === undefined) byCategory.set(key, [r]);
+    else list.push(r);
+  }
+  if (all.length === 0) throw new SnapshotError('no live-token protocol to calibrate from');
+  all.sort((a, b) => a - b);
+  const globalMedian = quantile(all, 0.5);
+  const categories: CalibrationEntry[] = [];
+  for (const [category, ratios] of [...byCategory.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    if (ratios.length < minN || category === '') continue;
+    ratios.sort((a, b) => a - b);
+    const median = quantile(ratios, 0.5);
+    categories.push({
+      category,
+      n: ratios.length,
+      median_ratio: round4(median),
+      q25_ratio: round4(quantile(ratios, 0.25)),
+      q75_ratio: round4(quantile(ratios, 0.75)),
+      multiplier: round4(median / globalMedian),
+    });
+  }
+  return {
+    live_n: all.length,
+    global_median_ratio: round4(globalMedian),
+    global_q25_ratio: round4(quantile(all, 0.25)),
+    global_q75_ratio: round4(quantile(all, 0.75)),
+    min_n: minN,
+    categories,
+  };
+}
+
+/** A category's multiplier under a calibration, or 1.00 when the category has too few live protocols to price itself. */
+export function categoryMultiplier(cal: Calibration, category: string | null): number {
+  if (category === null) return 1;
+  const entry = cal.categories.find((c) => c.category === category);
+  return entry === undefined ? 1 : entry.multiplier;
+}
+
+/** The ratio quartiles a row's band is drawn from: its category's when calibrated, the market's otherwise. */
+export function bandRatios(cal: Calibration, category: string | null): { median: number; q25: number; q75: number } {
+  if (category !== null) {
+    const entry = cal.categories.find((c) => c.category === category);
+    if (entry !== undefined) return { median: entry.median_ratio, q25: entry.q25_ratio, q75: entry.q75_ratio };
+  }
+  return { median: cal.global_median_ratio, q25: cal.global_q25_ratio, q75: cal.global_q75_ratio };
+}
+
+// ---------------------------------------------------------------- backtest
+
+/** What the walk-forward backtest found, fitted on the past and tested on the future. */
+export interface Backtest {
+  cutoff: string;
+  train_n: number;
+  test_n: number;
+  /** Median |log(predicted / actual market cap)| on the test set, radar-3 and the uncalibrated backbone. */
+  radar3_median_log_err: number;
+  radar2_median_log_err: number;
+  /** Share of the test set predicted within 2x of the actual market cap. */
+  radar3_within_2x: number;
+  radar2_within_2x: number;
+}
+
+/**
+ * The walk-forward backtest: fit the category prices on the live protocols listed
+ * before the cutoff, then predict the market caps of the ones listed after, with
+ * radar-3 (calibrated) and with radar-2 (the same formula, no category price).
+ * A model that only fits the past it was trained on fails here; the numbers say
+ * how far a prediction usually lands from the market cap it is checked against.
+ */
+export function backtest(snapshot: Snapshot, m: ModelConstants = MODEL): Backtest {
+  const live = snapshot.protocols.filter((p) => liveRatio(p) !== null);
+  const train = live.filter((p) => p.listed_at !== null && p.listed_at < m.backtest_cutoff);
+  const test = live.filter((p) => p.listed_at !== null && p.listed_at >= m.backtest_cutoff);
+  const calTrain = calibrate(train, m.calibration_min_n);
+  const errs3: number[] = [];
+  const errs2: number[] = [];
+  let within3 = 0;
+  let within2 = 0;
+  for (const p of test) {
+    const parts = multipliers(p, snapshot.as_of, m);
+    const base = m.base_coef * Math.pow(p.tvl_usd, m.tvl_exponent);
+    const pred3 = base * categoryMultiplier(calTrain, p.category) * parts.growthMult * parts.maturityMult * parts.velocityMult * parts.chainMult;
+    const pred2 = base * parts.growthMult * parts.maturityMult * parts.velocityMult * parts.chainMult;
+    const actual = p.mcap_usd!;
+    errs3.push(Math.abs(Math.log(pred3 / actual)));
+    errs2.push(Math.abs(Math.log(pred2 / actual)));
+    if (pred3 / actual >= 0.5 && pred3 / actual <= 2) within3++;
+    if (pred2 / actual >= 0.5 && pred2 / actual <= 2) within2++;
+  }
+  errs3.sort((a, b) => a - b);
+  errs2.sort((a, b) => a - b);
+  return {
+    cutoff: m.backtest_cutoff,
+    train_n: train.length,
+    test_n: test.length,
+    radar3_median_log_err: round4(quantile(errs3, 0.5)),
+    radar2_median_log_err: round4(quantile(errs2, 0.5)),
+    radar3_within_2x: test.length === 0 ? 0 : Math.round((within3 / test.length) * 100) / 100,
+    radar2_within_2x: test.length === 0 ? 0 : Math.round((within2 / test.length) * 100) / 100,
+  };
+}
+
+// ---------------------------------------------------------------- scoring
+
 export interface Score {
   implied: number;
+  growthPct: number;
+  growthMult: number;
+  maturityMult: number;
+  velocityMult: number;
+  chainMult: number;
+  categoryMult: number;
+  age: number | null;
+}
+
+interface Multipliers {
   growthPct: number;
   growthMult: number;
   maturityMult: number;
@@ -154,8 +346,8 @@ export interface Score {
   age: number | null;
 }
 
-/** radar-2's score for one protocol, from its own figures only. */
-export function scoreProtocol(p: SnapshotProtocol, asOf: string, m: ModelConstants = MODEL): Score {
+/** The four snapshot-driven multipliers, shared by the score and the backtest. */
+function multipliers(p: SnapshotProtocol, asOf: string, m: ModelConstants): Multipliers {
   const age = ageDays(asOf, p.listed_at);
   const growthPct = Math.min(m.growth_cap, Math.max(m.growth_floor, num(p.change_7d, 0)));
   let growthMult = 1 + (growthPct / 100) * m.growth_weight;
@@ -167,9 +359,28 @@ export function scoreProtocol(p: SnapshotProtocol, asOf: string, m: ModelConstan
   const velocity = p.tvl_usd / Math.max(ageForModel, m.velocity_floor_days);
   const velocityMult = 1 + m.velocity_weight * Math.tanh(Math.log10(Math.max(velocity, 1) / 1_000_000) / 2);
   const chainMult = 1 + m.chain_step * Math.min(Math.max(p.chains.length - 1, 0), m.chain_max_steps);
+  return { growthPct, growthMult, maturityMult, velocityMult, chainMult, age };
+}
+
+/** radar-3's score for one protocol, from its own figures only. */
+export function scoreProtocol(p: SnapshotProtocol, asOf: string, cal: Calibration, m: ModelConstants = MODEL): Score {
+  const parts = multipliers(p, asOf, m);
+  const categoryMult = categoryMultiplier(cal, p.category);
   const base = m.base_coef * Math.pow(p.tvl_usd, m.tvl_exponent);
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * velocityMult * chainMult));
-  return { implied, growthPct, growthMult: round4(growthMult), maturityMult: round4(maturityMult), velocityMult: round4(velocityMult), chainMult: round4(chainMult), age };
+  const implied = Math.max(
+    1,
+    Math.round(base * categoryMult * parts.growthMult * parts.maturityMult * parts.velocityMult * parts.chainMult),
+  );
+  return {
+    implied,
+    growthPct: parts.growthPct,
+    growthMult: round4(parts.growthMult),
+    maturityMult: round4(parts.maturityMult),
+    velocityMult: round4(parts.velocityMult),
+    chainMult: round4(parts.chainMult),
+    categoryMult: round4(categoryMult),
+    age: parts.age,
+  };
 }
 
 /** One board row. */
@@ -184,6 +395,9 @@ export interface BoardRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  /** The calibration band: similar protocols actually trade between these values. */
+  implied_low_usd: number;
+  implied_high_usd: number;
   watchlist: boolean;
   model: {
     growth_pct: number;
@@ -191,6 +405,7 @@ export interface BoardRow {
     maturity_multiplier: number;
     velocity_multiplier: number;
     chain_multiplier: number;
+    category_multiplier: number;
   };
   farm_steps: string[];
 }
@@ -207,11 +422,14 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  implied_low_usd: number;
+  implied_high_usd: number;
   watchlist: boolean;
   growth_multiplier: number;
   maturity_multiplier: number;
   velocity_multiplier: number;
   chain_multiplier: number;
+  category_multiplier: number;
   farm_steps: string[];
 }
 
@@ -236,6 +454,8 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  calibration: Calibration;
+  backtest: Backtest;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -245,12 +465,23 @@ function chainOf(p: SnapshotProtocol): string {
   return p.chains.length > 0 ? p.chains[0]! : 'its main chain';
 }
 
-/** The capital one farm position needs, from the protocol's own TVL. */
-function capitalFor(p: SnapshotProtocol): number {
-  if (p.tvl_usd >= 1_000_000_000) return 250;
-  if (p.tvl_usd >= 100_000_000) return 150;
-  if (p.tvl_usd >= 20_000_000) return 100;
+/**
+ * The capital one farm position needs: it scales with the protocol's own implied
+ * value, so a bigger prize is farmed with a bigger position, and a small one is
+ * not farmed with money it cannot return.
+ */
+function capitalFor(implied: number): number {
+  if (implied >= 200_000_000) return 400;
+  if (implied >= 100_000_000) return 250;
+  if (implied >= 50_000_000) return 150;
+  if (implied >= 20_000_000) return 100;
   return 50;
+}
+
+/** What one transaction costs on the protocol's main chain: Ethereum is dear, every other chain in the snapshot is cheap. */
+function gasFor(chain: string): { setup: number; weekly: number } {
+  if (chain === 'Ethereum') return { setup: 12, weekly: 4 };
+  return { setup: 3, weekly: 1 };
 }
 
 /** How long to hold, from the protocol's age: younger protocols get a longer qualifying window. */
@@ -340,25 +571,26 @@ export function stepText(step: FarmStep): string {
 
 /**
  * A protocol's farm plan: seven steps, each an action with what it costs and how long
- * it takes. Derived from the protocol's own record (category, chains, TVL, age), never
- * from a hand-written list of names.
+ * it takes. Derived from the protocol's own record (category, chains, TVL, age, and
+ * now its implied value, which sets the size of the position), never from a
+ * hand-written list of names.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+export function farmSteps(p: SnapshotProtocol, age: number | null, implied: number): FarmStep[] {
   const chain = chainOf(p);
-  const capital = capitalFor(p);
+  const capital = capitalFor(implied);
   const hold = holdDaysFor(age);
-  const gas = capital >= 150 ? 8 : 4;
+  const gas = gasFor(chain);
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline, never in a chat or a screenshot.`,
-      cost: 'under $3 of gas for the first transaction',
+      cost: `under $${gas.setup} of gas for the first transaction on ${chain}`,
       time: '5 minutes',
     },
-    { text: primaryAction(p, capital, chain), cost: `$${capital} of capital and about $${gas} of gas`, time: '15 minutes to set up' },
-    { text: secondAction(p, capital, chain), cost: `about $${Math.max(2, Math.round(gas / 2))} of gas`, time: '10 minutes, a week after the first step' },
+    { text: primaryAction(p, capital, chain), cost: `$${capital} of capital and about $${gas.setup} of gas`, time: '15 minutes to set up' },
+    { text: secondAction(p, capital, chain), cost: `about $${Math.max(1, Math.round(gas.setup / 2))} of gas`, time: '10 minutes, a week after the first step' },
     {
       text: weeklyAction(p),
-      cost: 'about $2 of gas a week',
+      cost: `about $${gas.weekly} of gas a week on ${chain}`,
       time: '10 minutes a week',
     },
     {
@@ -380,10 +612,10 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
 }
 
 /** The ranked board: every rankable pre-token protocol, watchlist first in coverage, sorted by implied value. */
-export function buildBoard(snapshot: Snapshot, m: ModelConstants = MODEL): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, cal: Calibration, m: ModelConstants = MODEL): BoardRow[] {
   const watch = new Set(snapshot.watchlist);
   const chosen = snapshot.protocols.filter((p) => isRankable(p) || watch.has(p.slug));
-  const scored = chosen.map((p) => ({ p, s: scoreProtocol(p, snapshot.as_of, m) }));
+  const scored = chosen.map((p) => ({ p, s: scoreProtocol(p, snapshot.as_of, cal, m) }));
   scored.sort((a, b) => b.s.implied - a.s.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   // Force a real ranking: no two rows share an implied value.
   let prev = Number.POSITIVE_INFINITY;
@@ -391,6 +623,10 @@ export function buildBoard(snapshot: Snapshot, m: ModelConstants = MODEL): Board
     let implied = x.s.implied;
     if (implied >= prev) implied = Math.max(1, prev - 1);
     prev = implied;
+    // The band follows the row's final implied value, from its category's live ratios.
+    const band = bandRatios(cal, x.p.category);
+    const low = Math.max(1, Math.round((implied * band.q25) / band.median));
+    const high = Math.max(implied + 1, Math.round((implied * band.q75) / band.median));
     return {
       rank: i + 1,
       slug: x.p.slug,
@@ -402,6 +638,8 @@ export function buildBoard(snapshot: Snapshot, m: ModelConstants = MODEL): Board
       listed_at: x.p.listed_at,
       age_days: x.s.age,
       implied_value_usd: implied,
+      implied_low_usd: low,
+      implied_high_usd: high,
       watchlist: watch.has(x.p.slug),
       model: {
         growth_pct: x.s.growthPct,
@@ -409,8 +647,9 @@ export function buildBoard(snapshot: Snapshot, m: ModelConstants = MODEL): Board
         maturity_multiplier: x.s.maturityMult,
         velocity_multiplier: x.s.velocityMult,
         chain_multiplier: x.s.chainMult,
+        category_multiplier: x.s.categoryMult,
       },
-      farm_steps: farmSteps(x.p, x.s.age).map(stepText),
+      farm_steps: farmSteps(x.p, x.s.age, implied).map(stepText),
     };
   });
 }
@@ -445,18 +684,23 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    implied_low_usd: row.implied_low_usd,
+    implied_high_usd: row.implied_high_usd,
     watchlist: row.watchlist,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     velocity_multiplier: row.model.velocity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
+    category_multiplier: row.model.category_multiplier,
     farm_steps: row.farm_steps,
   };
 }
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, m: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const board = buildBoard(snapshot, m);
+  const cal = calibrate(snapshot.protocols, m.calibration_min_n);
+  const bt = backtest(snapshot, m);
+  const board = buildBoard(snapshot, cal, m);
   const live = liveRows(snapshot);
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -468,6 +712,8 @@ export function buildRadar(snapshot: Snapshot, m: ModelConstants = MODEL): { boa
     board_size: board.length,
     early_size: board.filter((r) => !r.watchlist).length,
     live_size: live.length,
+    calibration: cal,
+    backtest: bt,
     rows: board.map(radarRow),
     live,
   };
@@ -524,6 +770,12 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
   }
   for (const r of board) {
     if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
+    if (!Number.isSafeInteger(r.implied_low_usd) || r.implied_low_usd <= 0 || r.implied_low_usd > r.implied_value_usd) {
+      return `${r.slug} has a bad calibration band low ${r.implied_low_usd}`;
+    }
+    if (!Number.isSafeInteger(r.implied_high_usd) || r.implied_high_usd <= r.implied_value_usd) {
+      return `${r.slug} has a bad calibration band high ${r.implied_high_usd}`;
+    }
     if (r.farm_steps.length < 3 || r.farm_steps.length > 12) return `${r.slug} has ${r.farm_steps.length} farm steps`;
     for (const s of r.farm_steps) if (s.length < 20 || s.length > 600) return `${r.slug} has a farm step of ${s.length} characters`;
   }

@@ -61,6 +61,7 @@
             <th data-sort="growth" class="num">7d</th>
             <th data-sort="age" class="num">Age</th>
             <th data-sort="implied" class="num">Implied value</th>
+            <th data-sort="implied" class="num">Range P25–P75</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -84,8 +85,12 @@
   </section>
   <section id="view-model" class="view" hidden>
     <h2>How the implied value is built</h2>
-    <p>Every row is scored by the same function, from the snapshot's own figures only. No protocol name is ever special-cased.</p>
+    <p>Every row is scored by the same function, from the snapshot's own figures only. No protocol name is ever special-cased. The price is calibrated on the market, not guessed: the snapshot's own live-token protocols — the ones whose token already trades and whose market cap the snapshot records — price each category. A category's multiplier is its live protocols' median market-cap-per-TVL divided by the whole market's median, and a category with fewer than five live protocols to price it falls back to the market median (multiplier 1.00).</p>
     <pre id="formula"></pre>
+    <h3>Category prices, fitted from the snapshot</h3>
+    <div id="calibration"></div>
+    <h3>Does the calibration hold up?</h3>
+    <div id="backtest"></div>
     <div id="modelNotes"></div>
   </section>
   <section id="detail" class="detail" hidden aria-live="polite"></section>

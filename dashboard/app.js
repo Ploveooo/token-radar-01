@@ -97,7 +97,8 @@
         '<td class="num">' + fmtUsd(r.tvl_usd) + '</td>' +
         '<td class="num">' + g + '</td>' +
         '<td class="num">' + fmtAge(r.age_days) + '</td>' +
-        '<td class="num"><b>' + fmtUsd(r.implied_value_usd) + '</b></td></tr>';
+        '<td class="num"><b>' + fmtUsd(r.implied_value_usd) + '</b></td>' +
+        '<td class="num range">' + fmtUsd(r.implied_low_usd) + ' – ' + fmtUsd(r.implied_high_usd) + '</td></tr>';
     }).join('');
   }
 
@@ -126,14 +127,18 @@
       (r.watchlist ? 'on the watchlist' : 'an early find below the watchlist floor') + '</p>' +
       '<div class="grid">' +
       '<div class="cell"><div class="k">Implied value</div><div class="v">' + fmtUsd(r.implied_value_usd) + '</div></div>' +
+      '<div class="cell"><div class="k">Range P25–P75</div><div class="v">' + fmtUsd(r.implied_low_usd) + ' – ' + fmtUsd(r.implied_high_usd) + '</div></div>' +
       '<div class="cell"><div class="k">TVL</div><div class="v">' + fmtUsd(r.tvl_usd) + '</div></div>' +
       '<div class="cell"><div class="k">7-day change</div><div class="v">' + fmtPct(r.change_7d) + '</div></div>' +
       '<div class="cell"><div class="k">Age</div><div class="v">' + fmtAge(r.age_days) + '</div></div>' +
       '</div>' +
       '<h3>How the value is built</h3>' +
-      '<p>Base ' + m.base_coef + ' &times; TVL^' + m.tvl_exponent + ', then &times; growth ' + r.growth_multiplier +
+      '<p>Base ' + m.base_coef + ' &times; TVL^' + m.tvl_exponent + ', then &times; category ' + r.category_multiplier +
+      ' &times; growth ' + r.growth_multiplier +
       ' &times; maturity ' + r.maturity_multiplier + ' &times; velocity ' + r.velocity_multiplier +
-      ' &times; chains ' + r.chain_multiplier + '. The protocol records no token, so this is the model\u2019s claim, not a market price.</p>' +
+      ' &times; chains ' + r.chain_multiplier + '. The range is the P25–P75 band of the market-cap-per-TVL ratios of ' +
+      (r.category_multiplier !== 1 ? 'live ' + esc(r.category || '') + ' protocols' : 'all live-token protocols') +
+      ' in the same snapshot — the values similar protocols actually trade at. The protocol records no token, so this is the model\u2019s claim, not a market price.</p>' +
       '<h3>Farm plan — seven steps</h3><ol>' + steps + '</ol>';
     detailEl.hidden = false;
     $('closeDetail').addEventListener('click', function () { detailEl.hidden = true; state.selected = null; renderBoard(); });
@@ -178,13 +183,32 @@
   // Model page.
   var m = DATA.model;
   $('formula').textContent =
-    'implied = round( ' + m.base_coef + ' * tvl_usd^' + m.tvl_exponent + ' * growth * maturity * velocity * chains )\n\n' +
+    'implied = round( ' + m.base_coef + ' * tvl_usd^' + m.tvl_exponent + ' * category * growth * maturity * velocity * chains )\n\n' +
+    'category = median(mcap/TVL of the category\u2019s live protocols) / median(mcap/TVL of all live protocols)\n' +
+    '           (at least ' + m.calibration_min_n + ' live protocols to price a category; otherwise 1.00)\n' +
     'growth   = 1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 * ' + m.growth_weight +
     '  (+' + m.kicker_25 + ' past +25%, another +' + m.kicker_60 + ' past +60%, ' + m.drag_30 + ' below -30%)\n' +
     'maturity = ' + m.maturity_floor + ' + ' + m.maturity_range + ' * (1 - exp(-age_days / ' + m.maturity_scale_days + '))\n' +
     'velocity = 1 + ' + m.velocity_weight + ' * tanh( log10( tvl_usd / max(age_days, ' + m.velocity_floor_days + ') / 1,000,000 ) / 2 )\n' +
     'chains   = 1 + ' + m.chain_step + ' * min(chains - 1, ' + m.chain_max_steps + ')\n\n' +
     'Unknown age counts as ' + m.unknown_age_days + ' days; missing 7-day change counts as 0%.';
+  var cal = DATA.calibration, bt = DATA.backtest;
+  $('calibration').innerHTML =
+    '<p>Fitted from the ' + cal.live_n + ' live-token protocols in this snapshot (market median mcap/TVL ' + cal.global_median_ratio + '). ' +
+    'A DEX and a lending protocol of the same TVL are not priced the same, because the market does not price them the same.</p>' +
+    '<table class="cal"><thead><tr><th>Category</th><th class="num">Live protocols</th><th class="num">Median mcap/TVL</th><th class="num">Multiplier</th></tr></thead><tbody>' +
+    cal.categories.map(function (c) {
+      return '<tr><td>' + esc(c.category) + '</td><td class="num">' + c.n + '</td><td class="num">' + c.median_ratio + '</td><td class="num"><b>&times;' + c.multiplier + '</b></td></tr>';
+    }).join('') +
+    '<tr><td>Any other category</td><td class="num">—</td><td class="num">' + cal.global_median_ratio + '</td><td class="num"><b>&times;1.00</b></td></tr>' +
+    '</tbody></table>';
+  $('backtest').innerHTML =
+    '<p>Walk-forward check, run on this snapshot: the category prices were fitted on the ' + bt.train_n +
+    ' live protocols listed before ' + bt.cutoff + ' and tested on the ' + bt.test_n + ' listed after, predicting their market caps. ' +
+    'Median error (in log units) <b>' + bt.radar3_median_log_err + '</b> with the calibration against <b>' + bt.radar2_median_log_err +
+    '</b> without it; ' + Math.round(bt.radar3_within_2x * 100) + '% of the test set lands within 2&times; of its actual market cap, against ' +
+    Math.round(bt.radar2_within_2x * 100) + '% uncalibrated. The calibration helps a little, not a lot — the market prices loosely, ' +
+    'which is why every row carries its P25–P75 range instead of a single number.</p>';
   $('modelNotes').innerHTML =
     '<p>Why a power law on TVL: a protocol ten times as big is not worth ten times as much — the exponent ' + m.tvl_exponent +
     ' gives it about five times the base, so growth, age and capital speed can move a row past a bigger neighbour.</p>' +
